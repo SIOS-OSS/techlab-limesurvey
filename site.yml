@@ -1,0 +1,185 @@
+---
+- hosts: limesurvey
+  become: yes
+  remote_user: centos
+  vars:
+    limesurvey_version: 3.15.2+181107
+  tasks:
+    - name: Enabling EPEL and SCL
+      yum:
+        name: "{{ packages }}"
+        state: present
+      vars:
+        packages:
+          - centos-release-scl
+          - epel-release
+
+    - name: Install required packages
+      yum:
+        name: "{{ packages }}"
+        state: present
+      vars:
+        packages:
+          - httpd
+          - MySQL-python
+          - mariadb
+          - mariadb-server
+          - mod_fcgid
+          - rh-php56
+          - rh-php56-php-fpm
+          - rh-php56-php-gd
+          - rh-php56-php-mysqlnd
+          - rh-php56-php-mbstring
+          - sclo-php56-php-mcrypt
+
+    - name: Configure PHP timezone
+      ini_file:
+        path: /etc/opt/rh/rh-php56/php.ini
+        section: Date
+        option: date.timezone
+        value: Asia/Tokyo
+
+    - block:
+        - name: Check server.cnf file stats
+          stat:
+            path: /etc/my.cnf.d/server.cnf
+          register: st
+
+        - name: Erase content of default server.cnf if it's size is not zero
+          copy:
+            content: ''
+            dest: /etc/my.cnf.d/server.cnf
+          when: st.stat.size > 0
+
+        - name: Copy my-small.cnf if server.cnf's size is not zero
+          copy:
+            src: /usr/share/mysql/my-small.cnf
+            dest: /etc/my.cnf.d/server-small.cnf
+            remote_src: yes
+          when: st.stat.size > 0
+
+        - name: Configure server-small.cnf
+          ini_file:
+            path: /etc/my.cnf.d/server-small.cnf
+            section: "{{ item.section }}"
+            option: "{{ item.option }}"
+            value: "{{ item.value }}"
+          loop:
+            - section: client
+              option: default-character-set
+              value: utf8
+            - section: mysqld
+              option: character-set-server
+              value: utf8
+
+    - name: Start MariaDB
+      systemd:
+        name: mariadb.service
+        enabled: yes
+        state: started
+
+    - name: Create limesurvey db
+      mysql_db:
+        name: limesurvey
+        state: present
+
+    - name: Create limesurvey user
+      mysql_user:
+        name: limesurvey
+        password: limesurvey
+        priv: 'limesurvey.*:ALL'
+        state: present
+
+    - name: Initialize the deploy root and gather facts
+      deploy_helper:
+        path: /var/www/limesurvey
+        release: "{{ limesurvey_version }}"
+
+    - name: Get limesurvey
+      get_url:
+        url: "https://github.com/LimeSurvey/LimeSurvey/archive/{{ limesurvey_version }}.tar.gz"
+        dest: "/tmp/{{ limesurvey_version }}.tar.gz"
+
+    - name: Create target directory
+      file:
+        path: "{{ deploy_helper.new_release_path }}"
+        state: directory
+
+    - name: Unarchive limesurvey
+      unarchive:
+        src: "/tmp/{{ limesurvey_version }}.tar.gz"
+        dest: "{{ deploy_helper.new_release_path }}"
+        creates: "{{ deploy_helper.new_release_path }}/index.php"
+        remote_src: yes
+        extra_opts:
+          - '--strip-components=1'
+
+    - name: Copy previous version files to new version
+      synchronize:
+        src: "{{ deploy_helper.previous_release_path }}/{{ item }}"
+        dest: "{{ deploy_helper.new_release_path }}/{{ item }}"
+        recursive: yes
+      loop:
+        - application/config/config.php
+        - upload
+      when: deploy_helper.previous_release != None and deploy_helper.new_release != deploy_helper.previous_release
+      delegate_to: "{{ inventory_hostname }}"
+
+    - name: Change owner and group
+      file:
+        path: "{{ deploy_helper.new_release_path }}"
+        owner: apache
+        group: apache
+        recurse: yes
+
+    - name: Configure selinux for rw content
+      sefcontext:
+        target: "{{ item }}"
+        setype: httpd_sys_rw_content_t
+        state: present
+      loop:
+        - "{{ deploy_helper.new_release_path | replace('+', '\\+') }}/application/config(/.*)?"
+        - "{{ deploy_helper.new_release_path | replace('+', '\\+') }}/tmp(/.*)?"
+        - "{{ deploy_helper.new_release_path | replace('+', '\\+') }}/upload(/.*)?"
+      notify: Exec restorecon
+
+    - name: Finalize the deploy
+      deploy_helper:
+        path: /var/www/limesurvey
+        release: "{{ deploy_helper.new_release }}"
+        state: finalize
+
+    - name: Create symblic link to current release
+      file:
+        path: /var/www/html/limesurvey
+        src: "{{ deploy_helper.current_path }}"
+        state: link
+
+    - name: Copy httpd configuration
+      copy:
+        src: limesurvey.conf
+        dest: /etc/httpd/conf.d/
+
+    - name: Start httpd
+      systemd:
+        name: httpd.service
+        enabled: yes
+        state: started
+
+    - name: Start php-fpm
+      systemd:
+        name: rh-php56-php-fpm.service
+        enabled: yes
+        state: started
+
+    - name: Open http port
+      firewalld:
+        service: http
+        permanent: yes
+        immediate: yes
+        state: enabled
+
+  handlers:
+    - name: Exec restorecon
+      command: "/usr/sbin/restorecon -R {{ deploy_helper.new_release_path }}"
+
